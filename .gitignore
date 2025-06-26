@@ -143,3 +143,6 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+
+# experiments files
+experiments/dpo/Qwen2-0.5B-DPO/data/
