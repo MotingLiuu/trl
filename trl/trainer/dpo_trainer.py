@@ -76,7 +76,7 @@ from .utils import (
 if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 
-if is_liger_kernel_available():
+if is_liger_kernel_available(): # liger_kernel_available?
     from liger_kernel.chunked_loss import LigerFusedLinearDPOLoss
 
 
@@ -94,12 +94,14 @@ def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id: int) -> 
 @dataclass
 class DataCollatorForPreference(DataCollatorMixin):
     """
+    针对于偏好数据的Collator，动态填充到批次的最大长度，prompt和response分别填充，并生成attention mask
+    
     Data collator used for preference data. Inputs are dynamically padded to the maximum length of a batch if they are
     not all of the same length.
 
     Args:
         pad_token_id (`int`):
-            Token ID to use for padding.
+            Token ID to use for padding. 
         return_tensors (`str`, *optional*, defaults to `"pt"`):
             Type of Tensor to return. Only `"pt"` is currently supported.
 
@@ -132,23 +134,25 @@ class DataCollatorForPreference(DataCollatorMixin):
     pad_token_id: int
     return_tensors: str = "pt"
 
-    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]: 
         # Convert to tensor
-        prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
-        prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
-        chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples]
-        chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
-        rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
-        rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
+        prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples] # 假设examples的元素是dict，prompt_input_ids包含了prompt_input_ids
+        prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids] # input_ids是tensor，产生形状相同的mask
+        chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples] # 同理
+        chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids] # 同理
+        rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples] # 同理
+        rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids] # 同理
+        
+        # 这里暂时不用管，这里是为了处理多模态模型
         if "pixel_values" in examples[0]:
-            pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
-        if "pixel_attention_mask" in examples[0]:
+            pixel_values = [torch.tensor(example["pixel_values"]) for example in examples] # 假设examples的元素是dict，pixel_values包含了pixel_values
+        if "pixel_attention_mask" in examples[0]: 
             pixel_attention_mask = [torch.tensor(example["pixel_attention_mask"]) for example in examples]
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
             ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
 
-        # Pad
+        # Pad pad 一组tensor，可选pad_token_id, padding_size
         output = {}
         output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
         output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")

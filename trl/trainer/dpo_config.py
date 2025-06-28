@@ -235,7 +235,7 @@ class DPOConfig(TrainingArguments):
     disable_dropout: bool = field(
         default=True,
         metadata={"help": "Whether to disable dropout in the model and reference model."},
-    )
+    ) 
     use_logits_to_keep: bool = field(
         default=False,
         metadata={
