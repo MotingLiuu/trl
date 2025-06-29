@@ -1,0 +1,12 @@
+{
+  "model_type": "hugging_face",
+  "path": "/path/to/your/local/llama3-70b-instruct",
+  "name": "Llama3-70B-Judge",
+  "instruction_args": {
+    "num_return_sequences": 1,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_new_tokens": 2048
+  },
+  "evaluation_type": "judge"
+}

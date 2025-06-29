@@ -1,0 +1,11 @@
+{
+  "model_type": "hugging_face",
+  "path": "../data/checkpoints-971",
+  "name": "Qwen2-0.5B-Instruct-DPO",
+  "instruction_args": {
+    "num_return_sequences": 1,
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "max_new_tokens": 1024
+  }
+}
