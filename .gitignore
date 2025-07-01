@@ -147,3 +147,4 @@ wandb/
 # experiments files
 experiments/dpo/*/data/
 experiments/cpo/*/data/
+experiments/instruct/*/data/
