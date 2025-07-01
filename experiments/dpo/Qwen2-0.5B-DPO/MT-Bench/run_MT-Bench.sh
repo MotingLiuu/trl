@@ -1,0 +1,1 @@
+python gen_model_answer.py --model-path ../data/checkpoint-971 --model-id Qwen2-0.5B-Instruct-DPO
