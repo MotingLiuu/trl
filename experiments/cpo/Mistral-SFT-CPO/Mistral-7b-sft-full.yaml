@@ -1,0 +1,24 @@
+dataset_name: trl-lib/ultrafeedback_binarized
+model_name_or_path: alignment-handbook/zephyr-7b-sft-full
+max_length: 1024
+max_prompt_length: 512
+lr_scheduler_type: cosine
+learning_rate: 5.0e-7
+num_train_epochs: 1
+beta: 0.01
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+warmup_ratio: 0.1
+gradient_checkpointing: true
+log_level: info
+logging_steps: 5
+do_eval: true
+eval_strategy: steps
+eval_steps: 400
+optim: adamw_torch
+output_dir: data
+report_to:
+  - tensorboard
+  - wandb
+
