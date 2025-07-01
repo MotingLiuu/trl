@@ -145,4 +145,5 @@ examples/notebooks/wandb/
 wandb/
 
 # experiments files
-experiments/dpo/Qwen2-0.5B-DPO/data/
+experiments/dpo/*/data/
+experiments/cpo/*/data/
