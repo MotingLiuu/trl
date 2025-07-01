@@ -1,0 +1,1 @@
+python gen_model_answer.py --model-path Qwen/Qwen2.5-0.5B-Instruct --model-id Qwen2-0.5B-Instruct
