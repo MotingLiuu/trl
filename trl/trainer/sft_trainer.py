@@ -1,65 +1,60 @@
-# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+import contextlib  # For creating context managers (like 'with' statements)
+import os  # For file and directory operations
+from collections import defaultdict  # Dict that provides default values for missing keys
+from dataclasses import dataclass  # For creating simple classes to hold data
+from pathlib import Path  # Modern way to handle file paths
+from typing import Any, Callable, Optional, Union  # Type hints for better code clarity
 
-import contextlib
-import os
-from collections import defaultdict
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, Optional, Union
+# From PyTorch (the deep learning framework):
+import torch  # Main PyTorch library for tensors and neural networks
+import torch.nn as nn  # Neural network modules (layers, loss functions, etc.)
 
-import torch
-import torch.nn as nn
-from accelerate import PartialState, logging
-from datasets import Dataset, IterableDataset
+# From Accelerate (handles distributed training, mixed precision, etc.):
+from accelerate import PartialState, logging  # Manages multi-GPU training automatically
+
+# From Datasets (HuggingFace library for handling data):
+from datasets import Dataset, IterableDataset  # Dataset types we can work with
+
+# From Transformers (HuggingFace library with pre-trained models):
 from transformers import (
-    AutoProcessor,
-    BaseImageProcessor,
-    DataCollator,
-    FeatureExtractionMixin,
-    PreTrainedModel,
-    PreTrainedTokenizerBase,
-    ProcessorMixin,
-    TrainingArguments,
+    AutoProcessor,  # Automatically loads the right processor for a model
+    BaseImageProcessor,  # Base class for image processing
+    DataCollator,  # Groups examples into batches
+    FeatureExtractionMixin,  # Base class for feature extractors
+    PreTrainedModel,  # Base class for all pre-trained models
+    PreTrainedTokenizerBase,  # Base class for tokenizers (text → numbers)
+    ProcessorMixin,  # Base class for processors (handles text + images)
+    TrainingArguments,  # Configuration for training
 )
-from transformers.data.data_collator import DataCollatorMixin
-from transformers.trainer_callback import TrainerCallback
-from transformers.trainer_utils import EvalPrediction
-from transformers.utils import is_peft_available
+from transformers.data.data_collator import DataCollatorMixin  # Mixin for data collators
+from transformers.trainer_callback import TrainerCallback  # For custom training callbacks
+from transformers.trainer_utils import EvalPrediction  # For evaluation predictions
+from transformers.utils import is_peft_available  # Check if PEFT library is installed
 
+# From TRL (this library - for training with human feedback):
 from ..data_utils import (
-    apply_chat_template,
-    is_conversational,
-    is_conversational_from_value,
-    maybe_convert_to_chatml,
-    pack_dataset,
-    prepare_multimodal_messages,
-    truncate_dataset,
+    apply_chat_template,  # Formats messages into chat format
+    is_conversational,  # Checks if data is in chat format
+    is_conversational_from_value,  # Checks conversational format from example
+    maybe_convert_to_chatml,  # Converts data to ChatML format
+    pack_dataset,  # Packs multiple samples into single sequences
+    prepare_multimodal_messages,  # Prepares messages with images
+    truncate_dataset,  # Cuts sequences to max length
 )
 from ..models import clone_chat_template, get_act_offloading_ctx_manager, prepare_peft_model
-from .base_trainer import BaseTrainer
-from .sft_config import SFTConfig
+from .base_trainer import BaseTrainer  # Parent class with core training logic
+from .sft_config import SFTConfig  # Configuration specific to SFT training
 from .utils import (
-    create_model_from_path,
-    entropy_from_logits,
-    flush_left,
-    pad,
-    remove_none_values,
-    selective_log_softmax,
+    create_model_from_path,  # Loads a model from HuggingFace or local path
+    entropy_from_logits,  # Calculates entropy (uncertainty) from model outputs
+    flush_left,  # Removes left padding from sequences
+    pad,  # Adds padding to make sequences same length
+    remove_none_values,  # Cleans None values from data
+    selective_log_softmax,  # Efficient softmax computation
 )
 
-
+# PEFT (Parameter-Efficient Fine-Tuning) - optional advanced feature:
+# Allows training only a small subset of model parameters (saves memory and time)
 if is_peft_available():
     from peft import PeftConfig, PeftModel
 
@@ -67,6 +62,8 @@ if is_peft_available():
 logger = logging.get_logger(__name__)
 
 
+# Flash Attention is an optimized attention implementation that's much faster
+# These are the variants we recognize and support
 FLASH_ATTENTION_VARIANTS = {
     "flash_attention_2",
     "flash_attention_3",
@@ -77,8 +74,46 @@ FLASH_ATTENTION_VARIANTS = {
 
 
 def get_dataset_column_names(dataset: Union[Dataset, IterableDataset]) -> list[str]:
+    """
+    Get the names of columns in a dataset.
+    
+    Why we need this:
+        Different dataset types store column names differently. This function
+        provides a unified way to get them.
+    
+    Example:
+        dataset = load_dataset("imdb")
+        columns = get_dataset_column_names(dataset)
+        # Returns: ["text", "label"]
+    """
     return list(next(iter(dataset)).keys()) if dataset.column_names is None else dataset.column_names
 
+
+
+# ================================================================================================
+# DATA COLLATOR FOR LANGUAGE MODELING
+# ================================================================================================
+# 🔧 WHAT THIS COLLATOR DOES:
+#
+#    Step 1: PADDING
+#        Problem: Sentences have different lengths
+#        Solution: Add special "padding" tokens to make them all the same length
+#       Example:
+#            Before: ["I am happy", "Dogs are great animals"]
+#            After:  ["I am happy <pad> <pad>", "Dogs are great animals"]
+#    Step 2: CREATE LABELS
+#    Step 3: CREATE ATTENTION MASK
+
+#
+# 💡 ADVANCED FEATURES:
+#
+#    - completion_only_loss: Only train on the "answer" part, not the "question" part
+#      Useful for: "Question: What is AI? Answer: AI is..." → only train on the answer
+#
+#    - padding_free: Advanced optimization where we don't use padding at all
+#      Instead, we concatenate everything into one long sequence (faster with FlashAttention)
+#
+# ================================================================================================
 
 @dataclass
 class DataCollatorForLanguageModeling(DataCollatorMixin):
@@ -148,37 +183,73 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
     ```
     """
 
-    pad_token_id: int
-    completion_only_loss: bool = True
-    padding_free: bool = False
-    pad_to_multiple_of: Optional[int] = None
-    return_tensors: str = "pt"
+    pad_token_id: int  # The token ID used for padding (e.g., 0 or 50256 for GPT-2)
+    completion_only_loss: bool = True  # Whether to only compute loss on completion part
+    padding_free: bool = False  # Whether to use padding-free training (advanced optimization)
+    pad_to_multiple_of: Optional[int] = None  # Pad length to multiple of this number (for efficiency)
+    return_tensors: str = "pt"  # Return PyTorch tensors ("pt" = PyTorch)
 
     def torch_call(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
-        # Convert to tensor
+        """
+        Main method that gets called to create a batch from individual examples.
+        
+        🔄 FLOW:
+            1. Convert examples to tensors
+            2. Handle padding (if needed) or flatten (if padding_free)
+            3. Create attention masks or position IDs
+            4. Apply completion masks if using completion_only_loss
+            5. Return batch dictionary ready for the model
+        
+        Args:
+            examples: List of dictionaries, each containing tokenized data
+                Example: [{"input_ids": [1, 2, 3]}, {"input_ids": [4, 5]}]
+        
+        Returns:
+            Dictionary with batched tensors:
+                - input_ids: The token IDs to feed to the model
+                - labels: What the model should predict (for computing loss)
+                - attention_mask or position_ids: Tells model which tokens to attend to
+        """
+        # ===== STEP 1: CONVERT TO TENSORS =====
         input_ids = [torch.tensor(example["input_ids"]) for example in examples]
+        
+        # If not provided explicitly, we use input_ids shifted by 1 position
         if "labels" in examples[0]:
             labels = [torch.tensor(example["labels"]) for example in examples]
         else:
             labels = [torch.tensor(example["input_ids"]) for example in examples]
 
+        # ===== STEP 2: HANDLE PADDING-FREE vs NORMAL PADDING =====
         # For padding-free, we should NOT create attention_mask as it causes FlashAttention to ignore position_ids and
         # compute wrong cu_seq_lens from the all-1s mask
         if self.padding_free:
+            # Padding-free mode: Create position IDs instead of attention mask
+            # Position IDs tell the model the position of each token (0, 1, 2, 3, ...)
             if "seq_lengths" in examples[0]:
+                # If we have packed sequences, get positions from seq_lengths
                 position_ids = self.get_position_ids_from_packed_seq_lengths(
                     [example["seq_lengths"] for example in examples]
                 )
             else:
+                # Otherwise, just number them sequentially: [0, 1, 2, 3, ...]
                 position_ids = [torch.arange(len(ids)) for ids in input_ids]
         else:
+            # Normal mode: Create attention mask (1 for real tokens, 0 for padding)
             attention_mask = [torch.ones_like(ids) for ids in input_ids]
+            
+        # ===== STEP 3: HANDLE COMPLETION MASKS =====
+        # Completion mask: 1 for tokens in the completion, 0 for tokens in the prompt
+        # Used when we only want to train on the answer, not the question
         if self.completion_only_loss and "completion_mask" in examples[0]:
             completion_mask = [torch.tensor(example["completion_mask"]) for example in examples]
+            
+        # Assistant masks: Similar but for chat conversations (marks assistant responses)
         if "assistant_masks" in examples[0]:
             assistant_masks = [torch.tensor(example["assistant_masks"]) for example in examples]
 
+        # ===== STEP 4: FLATTEN FOR PADDING-FREE (if enabled) =====
         # If padding_free, flatten everything into a single sequence
+        # Example: [[1,2,3], [4,5]] → [1,2,3,4,5]
         output = {}
         if self.padding_free:
             input_ids = [torch.cat(input_ids, dim=0)]
@@ -189,41 +260,71 @@ class DataCollatorForLanguageModeling(DataCollatorMixin):
             if "assistant_masks" in examples[0]:
                 assistant_masks = [torch.cat(assistant_masks, dim=0)]
 
-        # Pad
+        # ===== STEP 5: PAD SEQUENCES =====
+        # Pad input_ids to make all sequences the same length
+        # padding_value: What to use for padding (e.g., 0)
+        # padding_side: Add padding to the "right" (end) of sequences
         output["input_ids"] = pad(
             input_ids,
             padding_value=self.pad_token_id,
             padding_side="right",
             pad_to_multiple_of=self.pad_to_multiple_of,
         )
+        
+        # Pad labels (use -100 for padding, so loss ignores these positions)
+        # 🎓 TRANSFORMERS CONCEPT: -100 is a special value that tells the loss function to ignore this position
         output["labels"] = pad(
             labels, padding_value=-100, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         )
+        
+        # ===== STEP 6: HANDLE POSITION IDS OR ATTENTION MASK =====
         if self.padding_free:
+            # Padding-free: Add position IDs and mask padded positions in labels
             output["position_ids"] = pad(
                 position_ids, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
+            # Where position_id is 0 (padded), set label to -100 (ignore)
             output["labels"][output["position_ids"] == 0] = -100
         else:
+            # Normal: Add attention mask
             output["attention_mask"] = pad(
                 attention_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
+            
+        # ===== STEP 7: APPLY COMPLETION MASK (if using completion_only_loss) =====
+        # If we only want to train on completions, mask out the prompt parts
         if self.completion_only_loss and "completion_mask" in examples[0]:
             completion_mask = pad(
                 completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
+            # Where completion_mask is 0 (prompt part), set label to -100 (don't train on it)
             output["labels"][completion_mask == 0] = -100  # mask everything that is not in the completion
+            
+        # Apply assistant masks (similar to completion mask but for chat)
         if "assistant_masks" in examples[0]:
             assistant_masks = pad(
                 assistant_masks, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
             )
             output["labels"][assistant_masks == 0] = -100
+            
         return output
 
     @staticmethod
     def get_position_ids_from_packed_seq_lengths(batch_seq_lengths: list[list[int]]) -> list[torch.Tensor]:
         """
         Get position IDs for packed sequences.
+        
+        🎯 PURPOSE:
+            When we "pack" multiple documents into one sequence, we need to tell the model
+            where each document starts and ends. Position IDs do this.
+            
+        📦 PACKING EXAMPLE:
+            Document 1: "Hello world" (3 tokens) 
+            Document 2: "AI is cool" (3 tokens)
+            Packed: "Hello world AI is cool" → positions: [0,1,2, 0,1,2]
+                                                           ^doc1  ^doc2
+            
+            Notice positions reset to 0 at the start of each document!
 
         Args:
             batch_seq_lengths (`list[list[int]]`):
@@ -442,22 +543,125 @@ class DataCollatorForVisionLanguageModeling(DataCollatorMixin):
         return output
 
 
+# ================================================================================================
+# DFT LOSS FUNCTION
+# ================================================================================================
+#
+# 🎯 WHAT IS DFT LOSS?
+#    DFT (Distributional Fine-Tuning) is an alternative loss function for training language models.
+#    Instead of the standard "next token prediction" loss, it uses a distributional approach.
+#
+# 📊 HOW IS IT DIFFERENT FROM STANDARD LOSS?
+#    - Standard Loss (NLL - Negative Log Likelihood): Maximizes probability of correct token
+#    - DFT Loss: Considers the entire distribution of possible next tokens
+#
+# 🔬 TECHNICAL DETAILS:
+#    The loss weights each token by its own probability (from the model's prediction).
+#    This creates a different learning signal that can lead to better generalization.
+#
+# 📖 REFERENCE:
+#    Paper: "On the Generalization of SFT: A Reinforcement Learning Perspective with Reward Rectification"
+#    Link: https://huggingface.co/papers/2508.05629
+#
+# ================================================================================================
+
 def dft_loss(outputs, labels, num_items_in_batch=None):
     """
     DFT loss function, as presented in [On the Generalization of SFT: A Reinforcement Learning Perspective with Reward
     Rectification](https://huggingface.co/papers/2508.05629)
+    
+    Args:
+        outputs: Model outputs containing logits (raw predictions before softmax)
+        labels: Ground truth token IDs
+        num_items_in_batch: Number of items for normalization
+        
+    Returns:
+        Scalar loss value
     """
+    # Pad labels with one extra position for shifting
     labels = nn.functional.pad(labels, (0, 1), value=-100)
+    
+    # Shift labels to align with predictions (predict next token)
     shift_labels = labels[..., 1:].contiguous()
+    
+    # Create mask: which positions should we compute loss on?
+    # (ignore positions with -100, which are padding or prompt parts we don't train on)
     loss_mask = shift_labels != -100
-    shift_labels[~loss_mask] = 0
+    shift_labels[~loss_mask] = 0  # Set masked positions to 0 (arbitrary, will be ignored)
+    
+    # Compute log probabilities for the correct tokens
     logprobs = selective_log_softmax(outputs.logits, shift_labels)
+    
+    # DFT-specific: Weight by the probability (exp of log probability)
+    # This is different from standard cross-entropy loss!
     per_token_loss = -logprobs.exp().detach() * logprobs
+    
+    # Normalize by number of items
     if num_items_in_batch is None:
         num_items_in_batch = loss_mask.sum()
     loss = (per_token_loss * loss_mask).sum() / num_items_in_batch
+    
     return loss
 
+
+# ================================================================================================
+# SFT TRAINER - MAIN CLASS
+# ================================================================================================
+#
+# 🎯 THIS IS THE MAIN CLASS YOU'LL USE!
+#
+# The SFTTrainer is your one-stop shop for supervised fine-tuning. It handles:
+#   ✅ Loading models (from HuggingFace or local paths)
+#   ✅ Processing datasets (tokenization, formatting, packing)
+#   ✅ Creating batches (via data collators)
+#   ✅ Training loop (forward pass, loss computation, backpropagation)
+#   ✅ Evaluation and metrics (accuracy, entropy, etc.)
+#   ✅ Checkpointing (saving model during training)
+#   ✅ Distributed training (multi-GPU automatically)
+#
+# 🔄 TRAINING FLOW (What happens when you call trainer.train()):
+#
+#   1. INITIALIZATION (in __init__):
+#      - Load model and tokenizer
+#      - Process dataset (tokenize, format)
+#      - Set up data collator
+#      - Configure optimizer and scheduler
+#
+#   2. TRAINING LOOP (repeated for each batch):
+#      a. Get batch from data collator
+#      b. Forward pass: Feed data to model → get predictions
+#      c. Compute loss: Compare predictions to labels
+#      d. Backward pass: Compute gradients
+#      e. Update weights: Optimize model parameters
+#      f. Log metrics: Track progress
+#
+#   3. EVALUATION (if eval_dataset provided):
+#      - Run model on validation data
+#      - Compute metrics (accuracy, loss, etc.)
+#      - Save best checkpoint
+#
+#   4. SAVE FINAL MODEL:
+#      - Save trained weights
+#      - Save tokenizer/processor
+#      - Create model card
+#
+# 🎓 KEY TRANSFORMERS CONCEPTS USED:
+#
+#   - PreTrainedModel: Base class for all transformer models (GPT, BERT, Llama, etc.)
+#   - Tokenizer: Converts text ↔ token IDs (numbers)
+#   - Processor: Handles both text and images (for vision-language models)
+#   - TrainingArguments: Configuration for training (batch size, learning rate, etc.)
+#   - Trainer: Base class with training loop logic (we inherit from BaseTrainer which inherits from Trainer)
+#
+# 💡 SIMPLE USAGE:
+#
+#   trainer = SFTTrainer(
+#       model="gpt2",  # Any HuggingFace model name
+#       train_dataset=my_dataset,
+#   )
+#   trainer.train()  # That's it!
+#
+# ================================================================================================
 
 class SFTTrainer(BaseTrainer):
     """
@@ -550,8 +754,8 @@ class SFTTrainer(BaseTrainer):
             converts the dataset into a [language modeling](#language-modeling) type.
     """
 
-    _tag_names = ["trl", "sft"]
-    _name = "SFT"
+    _tag_names = ["trl", "sft"]  # Tags to add to model card
+    _name = "SFT"  # Display name for this trainer
 
     def __init__(
         self,
@@ -570,21 +774,54 @@ class SFTTrainer(BaseTrainer):
         peft_config: Optional["PeftConfig"] = None,
         formatting_func: Optional[Callable[[dict], str]] = None,
     ):
+        """
+        Initialize the SFT Trainer.
+        
+        🔄 INITIALIZATION FLOW (9 MAIN STEPS):
+        
+        Step 1: Process arguments (create SFTConfig if needed)
+        Step 2: Load or validate the model
+        Step 3: Load or create the tokenizer/processor
+        Step 4: Handle special tokens (EOS, padding)
+        Step 5: Set up PEFT (if using parameter-efficient fine-tuning)
+        Step 6: Create data collator
+        Step 7: Process datasets (tokenize, format, pack/truncate)
+        Step 8: Set up loss function
+        Step 9: Initialize parent Trainer class
+        
+        This method sets up everything needed for training!
+        """
+        
+        # ============================================================================
+        # STEP 1: PROCESS ARGUMENTS
+        # ============================================================================
+        # Create default SFTConfig if none provided
         # Args
         if args is None:
+            # Extract model name for creating a default output directory
             model_name = model if isinstance(model, str) else model.config._name_or_path
-            model_name = model_name.split("/")[-1]
+            model_name = model_name.split("/")[-1]  # Get just the model name (e.g., "gpt2" from "openai/gpt2")
             args = SFTConfig(f"{model_name}-SFT")
         elif isinstance(args, TrainingArguments) and not isinstance(args, SFTConfig):
+            # Convert TrainingArguments to SFTConfig
             dict_args = args.to_dict()
             dict_args["hub_token"] = args.hub_token  # to_dict hides the hub_token
             dict_args.pop("push_to_hub_token")
             args = SFTConfig(**dict_args)
 
+        # ============================================================================
+        # STEP 2: LOAD OR VALIDATE MODEL
+        # ============================================================================
+        # 🎓 TRANSFORMERS CONCEPT - AutoModel.from_pretrained():
+        #    This automatically detects the model architecture and loads it
+        #    Example: "gpt2" → loads GPT2LMHeadModel
+        #             "bert-base-uncased" → loads BertModel
         # Model
         if isinstance(model, str):
+            # Load model from HuggingFace Hub or local path
             model = create_model_from_path(model, **args.model_init_kwargs or {})
         else:
+            # Model already instantiated
             if args.model_init_kwargs is not None:
                 logger.warning(
                     "You passed `model_init_kwargs` to the `SFTConfig`, but your model is already instantiated. "
@@ -592,8 +829,19 @@ class SFTTrainer(BaseTrainer):
                 )
         model_id = model.config._name_or_path
 
+        # ============================================================================
+        # STEP 3: LOAD TOKENIZER/PROCESSOR
+        # ============================================================================
+        # 🎓 TRANSFORMERS CONCEPT - Tokenizer:
+        #    Converts text to numbers (tokens) that the model can process
+        #    Example: "Hello world" → [15496, 995]
+        #
+        # 🎓 TRANSFORMERS CONCEPT - Processor:
+        #    Like a tokenizer but also handles images (for vision-language models)
+        #    Example: Processes both "What is this?" and an image
         # Processing class
         if processing_class is None:
+            # Load the appropriate processor/tokenizer for this model
             processing_class = AutoProcessor.from_pretrained(model_id)
 
         # Handle pad token for processors or tokenizers

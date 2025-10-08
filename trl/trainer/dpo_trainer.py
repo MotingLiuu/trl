@@ -12,6 +12,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+================================================================================
+DPO (Direct Preference Optimization) Trainer
+================================================================================
+
+WHAT IS THIS FILE FOR?
+----------------------
+This file implements the DPO training method - a way to train language models
+to prefer certain outputs over others WITHOUT needing a separate reward model.
+
+SIMPLE EXPLANATION:
+-------------------
+Think of DPO like teaching a student by showing them examples of good and bad
+answers, and adjusting their understanding based on which they prefer.
+
+Traditional approach (RLHF): Train a reward model first, then use it to train
+DPO approach: Directly train the model by comparing good vs bad responses
+
+KEY CONCEPTS:
+-------------
+1. CHOSEN vs REJECTED: For each prompt, we have a "good" response (chosen) 
+   and a "bad" response (rejected)
+   
+2. REFERENCE MODEL: A copy of the original model that stays frozen - we use 
+   it to measure how much the model is changing
+   
+3. PREFERENCE LEARNING: The model learns to increase probability of chosen 
+   responses and decrease probability of rejected responses
+
+4. BETA PARAMETER: Controls how much we want the model to change from the 
+   reference model (higher = more conservative)
+
+MAIN COMPONENTS:
+----------------
+- DataCollatorForPreference: Organizes data batches
+- DPOTrainer: The main trainer class that handles the training loop
+- Loss functions: Calculate how well the model is learning preferences
+"""
+
 import inspect
 import random
 import textwrap
@@ -95,19 +134,77 @@ if is_mlflow_available():
 logger = logging.get_logger(__name__)
 
 
+# ============================================================================
+# UTILITY FUNCTION: shift_tokens_right
+# ============================================================================
 def shift_tokens_right(input_ids: torch.Tensor, decoder_start_token_id: int) -> torch.Tensor:
-    """Shift input ids one token to the right, and pad with pad_token_id"""
+    """
+    Shift input ids one token to the right, and pad with pad_token_id
+    
+    WHY THIS EXISTS:
+    ----------------
+    For encoder-decoder models (like T5), we need to prepare the decoder input
+    by shifting tokens. This is like saying "to predict word N, look at words 0 to N-1"
+    
+    SIMPLE ANALOGY:
+    ---------------
+    Imagine a sentence: "The cat sat"
+    Original:  [The, cat, sat]
+    Shifted:   [START, The, cat]
+    
+    This way, when predicting "cat", the model only sees "The", not the future words.
+    
+    PARAMETERS:
+    -----------
+    - input_ids: The token IDs we want to shift [batch_size, sequence_length]
+    - decoder_start_token_id: Special token to put at the beginning
+    
+    RETURNS:
+    --------
+    Shifted version where each token is moved one position to the right
+    """
     shifted_input_ids = input_ids.new_zeros(input_ids.shape)
-    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()
-    shifted_input_ids[:, 0] = decoder_start_token_id
+    shifted_input_ids[:, 1:] = input_ids[:, :-1].clone()  # Move everything right
+    shifted_input_ids[:, 0] = decoder_start_token_id      # Put START token at beginning
     return shifted_input_ids
 
 
+# ============================================================================
+# DATA COLLATOR: DataCollatorForPreference
+# ============================================================================
 @dataclass
 class DataCollatorForPreference(DataCollatorMixin):
     """
     Data collator used for preference data. Inputs are dynamically padded to the maximum length of a batch if they are
     not all of the same length.
+    
+    WHAT DOES THIS DO?
+    ------------------
+    This class takes multiple training examples and combines them into a batch.
+    Since different examples have different lengths, it pads them to match.
+    
+    SIMPLE ANALOGY:
+    ---------------
+    Imagine organizing papers of different lengths into a neat stack:
+    - Paper 1: 3 pages
+    - Paper 2: 5 pages
+    - Paper 3: 2 pages
+    
+    You add blank pages to make them all 5 pages long, so they stack evenly.
+    
+    WHY WE NEED THIS:
+    -----------------
+    Neural networks process data in batches (multiple examples at once).
+    All examples in a batch must be the same length, so we pad shorter ones.
+    
+    WHAT GETS COLLATED:
+    -------------------
+    For each training example, we have:
+    - prompt_input_ids: The question/instruction tokens
+    - chosen_input_ids: The "good" response tokens  
+    - rejected_input_ids: The "bad" response tokens
+    - attention_masks: Which tokens are real vs padding
+    - (optionally) pixel_values: For vision-language models
 
     Args:
         pad_token_id (`int`):
@@ -145,35 +242,56 @@ class DataCollatorForPreference(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
-        # Convert to tensor
+        """
+        Convert a list of examples into a batched dictionary of tensors.
+        
+        STEP-BY-STEP PROCESS:
+        ---------------------
+        1. Extract all the data fields from each example
+        2. Convert everything to PyTorch tensors
+        3. Pad all tensors to the same length
+        4. Return as a dictionary for the model to use
+        """
+        # Step 1 & 2: Convert to tensors
+        # Extract prompt tokens and create attention masks (1 for real tokens, 0 for padding)
         prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
         prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
         chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples]
         chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
         rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
         rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
+        
+        # Handle vision data if present (for vision-language models)
         if "pixel_values" in examples[0]:
             pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
         if "pixel_attention_mask" in examples[0]:
             pixel_attention_mask = [torch.tensor(example["pixel_attention_mask"]) for example in examples]
+        
+        # Handle precomputed reference log probabilities (optimization for speed)
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
             ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
 
-        # Pad
+        # Step 3: Pad everything to the same length
         output = {}
+        # Pad prompts on the LEFT (so the actual prompt is at the end)
         output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
         output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")
+        # Pad completions on the RIGHT (standard padding)
         output["chosen_input_ids"] = pad(chosen_input_ids, padding_value=self.pad_token_id)
         output["chosen_attention_mask"] = pad(chosen_attention_mask, padding_value=0)
         output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
         output["rejected_attention_mask"] = pad(rejected_attention_mask, padding_value=0)
+        
+        # Add vision data if it exists
         if "pixel_values" in examples[0]:
             output["pixel_values"] = pad(pixel_values, padding_value=0.0)
         if "pixel_attention_mask" in examples[0]:
             output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
         if "image_sizes" in examples[0]:
             output["image_sizes"] = torch.tensor([example["image_sizes"] for example in examples])
+        
+        # Add precomputed reference values if they exist
         if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
             output["ref_chosen_logps"] = ref_chosen_logps
             output["ref_rejected_logps"] = ref_rejected_logps
@@ -181,9 +299,75 @@ class DataCollatorForPreference(DataCollatorMixin):
         return output
 
 
+# ============================================================================
+# MAIN TRAINER CLASS: DPOTrainer
+# ============================================================================
 class DPOTrainer(BaseTrainer):
     """
+    ============================================================================
     Trainer for Direct Preference Optimization (DPO) method.
+    ============================================================================
+    
+    WHAT IS DPO?
+    ------------
+    DPO is a method to train language models to follow human preferences
+    WITHOUT needing a separate reward model (unlike traditional RLHF).
+    
+    THE BIG IDEA:
+    -------------
+    Instead of:
+      1. Train a reward model on preferences (slow, complex)
+      2. Use the reward model to train your LLM (2 models needed)
+    
+    DPO does:
+      1. Directly train the LLM using preference pairs (1 model, simpler)
+    
+    HOW IT WORKS:
+    -------------
+    For each training example, you provide:
+      - A PROMPT: "Write a poem about cats"
+      - A CHOSEN response: A good poem (high quality)
+      - A REJECTED response: A bad poem (low quality)
+    
+    The trainer adjusts the model to:
+      ✓ Increase probability of the CHOSEN response
+      ✗ Decrease probability of the REJECTED response
+    
+    But with a twist! It uses a REFERENCE MODEL (frozen copy of original model)
+    to prevent the model from changing too drastically.
+    
+    THE MATH (SIMPLIFIED):
+    ----------------------
+    loss = -log(sigmoid(β * (log_π(chosen) - log_π(rejected) 
+                           - log_π_ref(chosen) + log_π_ref(rejected))))
+    
+    Where:
+      - β (beta): How much to trust the preferences vs staying close to reference
+      - log_π: Log probability the policy (your model) assigns to a response
+      - log_π_ref: Log probability the reference model assigns to it
+      - sigmoid: Converts to a probability between 0 and 1
+    
+    KEY COMPONENTS:
+    ---------------
+    1. MODEL: The language model being trained
+    2. REF_MODEL: Frozen copy of the original model (or None if using PEFT)
+    3. BETA: Temperature parameter controlling how aggressive the optimization is
+    4. LOSS_TYPE: Different mathematical formulations (sigmoid, hinge, IPO, etc.)
+    
+    TRAINING MODES:
+    ---------------
+    - Standard: Uses a frozen reference model
+    - PEFT: Uses adapter layers, reference is the base model with adapters off
+    - Reference-free: No reference model (less stable but simpler)
+    - Precomputed: Reference log probs computed once beforehand (faster)
+    
+    TYPICAL WORKFLOW:
+    -----------------
+    1. Load a pretrained model
+    2. Create DPOTrainer with preference dataset
+    3. Call trainer.train()
+    4. Model learns to prefer chosen over rejected responses
+    5. Save the improved model
 
     This class is a wrapper around the [`transformers.Trainer`] class and inherits all of its attributes and methods.
 
@@ -246,6 +430,7 @@ class DPOTrainer(BaseTrainer):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
     """
 
+    # Metadata for tracking
     _tag_names = ["trl", "dpo"]
     _name = "DPO"
     _paper = {
@@ -281,22 +466,50 @@ class DPOTrainer(BaseTrainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional["PeftConfig"] = None,
     ):
-        # Args
+        """
+        Initialize the DPO Trainer.
+        
+        INITIALIZATION STEPS:
+        ---------------------
+        1. Setup args (training configuration)
+        2. Load/prepare the model and reference model
+        3. Setup tokenizer/processor
+        4. Handle PEFT (Parameter-Efficient Fine-Tuning) if needed
+        5. Setup data collator and datasets
+        6. Initialize parent trainer class
+        7. Prepare models for distributed training
+        """
+        
+        # ====================================================================
+        # STEP 1: Configuration Setup
+        # ====================================================================
+        # ====================================================================
+        # STEP 1: Configuration Setup
+        # ====================================================================
+        # If no config provided, create a default one using the model name
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
             args = DPOConfig(f"{model_name}-DPO")
 
-        # Model and reference model
+        # ====================================================================
+        # STEP 2: Model Setup
+        # ====================================================================
+        # Load the model if it's just a path/name (string)
         if isinstance(model, str):
             model = create_model_from_path(model, **args.model_init_kwargs or {})
         else:
+            # Model is already loaded, so ignore any init kwargs
             if args.model_init_kwargs is not None:
                 logger.warning(
                     "You passed `model_init_kwargs` to the `DPOConfig`, but your model is already instantiated. "
                     "The `model_init_kwargs` will be ignored."
                 )
+        
+        # Store the model ID for later use (e.g., loading tokenizer)
         model_id = model.config._name_or_path
+        
+        # Similarly, load reference model if it's a string
         if isinstance(ref_model, str):
             ref_model = create_model_from_path(ref_model, **args.ref_model_init_kwargs or {})
         else:
@@ -305,28 +518,38 @@ class DPOTrainer(BaseTrainer):
                     "You passed `ref_model_init_kwargs` to the `DPOConfig`, but your model is already instantiated. "
                     "The `ref_model_init_kwargs` will be ignored."
                 )
+        
+        # Safety check: model and ref_model can't be the same Python object
+        # (they can have the same weights, but must be separate instances)
         if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you can simply omit the `ref_model` argument and it will be created for you."
             )
 
-        # Processing class
+        # ====================================================================
+        # STEP 3: Tokenizer/Processor Setup
+        # ====================================================================
+        # The "processing class" handles converting text/images to model inputs
+        # It could be a tokenizer (text only) or processor (text + images)
         if processing_class is None:
             processing_class = AutoProcessor.from_pretrained(model_id)
 
-        # Handle pad token for processors or tokenizers
+        # Extract the tokenizer and detect if this is a vision-language model
         if isinstance(processing_class, ProcessorMixin):
-            tokenizer = processing_class.tokenizer
+            tokenizer = processing_class.tokenizer  # VLM case
             self._is_vlm = True
         elif isinstance(processing_class, PreTrainedTokenizerBase):
-            tokenizer = processing_class
+            tokenizer = processing_class  # Text-only case
             self._is_vlm = False
         else:
             raise TypeError("The `processing_class` must be either a `PreTrainedTokenizerBase` or a `ProcessorMixin`")
 
-        # Get the pad token: if not provided, use the one from the processing class or the eos token
-        # if the processing class does not have a pad token.
+        # ====================================================================
+        # STEP 4: Padding Token Setup
+        # ====================================================================
+        # We need a padding token to make sequences the same length in a batch
+        # Priority: args.pad_token > tokenizer.pad_token > tokenizer.eos_token
         if args.padding_value is not None:  # deprecated, will be removed in 0.26.0.
             warnings.warn(
                 "The `padding_value` argument is deprecated and will be removed in version 0.26.0. Please use "
@@ -343,37 +566,60 @@ class DPOTrainer(BaseTrainer):
                     "in the vocabulary before using it as a padding token."
                 )
 
-        # PEFT configuration and model wrapping
+        # ====================================================================
+        # STEP 5: PEFT (Parameter-Efficient Fine-Tuning) Setup
+        # ====================================================================
+        # PEFT allows training only a small subset of parameters (adapters)
+        # This saves memory and computation
         model = self._prepare_peft_model(model, ref_model, peft_config, args)
 
+        # ====================================================================
+        # STEP 6: Validation and Feature Flags
+        # ====================================================================
+        # Check if we need experiment tracking for generation during eval
         if args.generate_during_eval and not (is_wandb_available() or is_comet_available() or is_mlflow_available()):
             raise ValueError(
                 "`generate_during_eval=True` requires Weights and Biases, MLFlow or Comet to be installed."
                 " Please install `wandb`, `mlflow` or `comet-ml` to resolve."
             )
 
-        self.is_encoder_decoder = model.config.is_encoder_decoder
+        # Store model characteristics
+        self.is_encoder_decoder = model.config.is_encoder_decoder  # e.g., T5, BART
         self.is_vision_model = model.config.model_type in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES.keys()
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
         self.reference_free = args.reference_free
 
+        # ====================================================================
+        # STEP 7: Reference Model Setup
+        # ====================================================================
+        # The reference model provides the "anchor" for optimization
+        # We compare current model probabilities against reference model probabilities
         if ref_model:
+            # User provided a reference model explicitly
             self.ref_model = ref_model
         elif self.is_peft_model or args.precompute_ref_log_probs:
-            # The `model` with adapters turned off will be used as the reference model
+            # For PEFT: reference is the base model (adapters turned off)
+            # For precompute: we calculate reference probs once beforehand
             self.ref_model = None
         else:
+            # Standard case: create a frozen copy of the model
             self.ref_model = create_reference_model(model)
 
-        # Disable dropout in the model and reference model
+        # ====================================================================
+        # STEP 8: Dropout Handling
+        # ====================================================================
+        # Disable dropout for more stable training (optional)
         if args.disable_dropout:
             disable_dropout_in_model(model)
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
 
-        # Liger kernel
+        # ====================================================================
+        # STEP 9: Liger Kernel Setup (Optional Optimization)
+        # ====================================================================
+        # Liger kernel is a fused implementation for faster DPO loss computation
         if args.use_liger_loss:
             if not is_liger_kernel_available():
                 raise ImportError(
@@ -1685,83 +1931,196 @@ class DPOTrainer(BaseTrainer):
 
         return output
 
+    # ========================================================================
+    # CORE METHOD: get_batch_loss_metrics
+    # ========================================================================
     def get_batch_loss_metrics(
         self,
         model: Union[PreTrainedModel, nn.Module],
         batch: dict[str, Union[list, torch.LongTensor]],
         train_eval: Literal["train", "eval"] = "train",
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
+        """
+        Compute the DPO loss and other metrics for the given batch of inputs for train or test.
+        
+        THIS IS THE HEART OF DPO TRAINING!
+        ==================================
+        
+        WHAT THIS METHOD DOES:
+        ----------------------
+        This is where the magic happens! For each batch, this method:
+        1. Gets model predictions for chosen and rejected responses
+        2. Gets reference model predictions
+        3. Calculates how much the model prefers chosen over rejected
+        4. Compares this to how much the reference model prefers chosen over rejected
+        5. Creates a loss that encourages the model to prefer chosen more
+        
+        SIMPLE ANALOGY:
+        ---------------
+        Imagine teaching a student to rate essays:
+        - Student (model) rates Essay A = 8/10, Essay B = 6/10
+        - Teacher (reference) rated Essay A = 7/10, Essay B = 7/10
+        - Student prefers A more than teacher does → Good! Small loss
+        - If student preferred B more → Bad! Large loss
+        
+        THE LOSS FORMULA (SIMPLIFIED):
+        ------------------------------
+        loss = -log(sigmoid(β × (model_preference - ref_preference)))
+        
+        Where:
+        - model_preference = how much MORE the model likes chosen vs rejected
+        - ref_preference = how much MORE the reference likes chosen vs rejected
+        - β (beta) = controls how aggressive the training is
+        - sigmoid = converts to probability (0 to 1)
+        - -log = makes it a loss (lower is better)
+        
+        PARAMETERS:
+        -----------
+        model: The language model being trained
+        batch: Dictionary containing:
+            - prompt_input_ids: The questions/instructions
+            - chosen_input_ids: The good responses
+            - rejected_input_ids: The bad responses
+            - attention_masks: Which tokens are real vs padding
+            - (optional) ref_chosen_logps, ref_rejected_logps: Precomputed reference scores
+        train_eval: Whether this is for training or evaluation
+        
+        RETURNS:
+        --------
+        - losses: The loss value to optimize (lower = better)
+        - metrics: Dictionary of useful tracking metrics like accuracy, rewards, etc.
+        """
         metrics = {}
 
+        # ====================================================================
+        # STEP 1: Get Model Predictions
+        # ====================================================================
+        # We can use two different methods to compute the loss:
+        # A) Liger kernel (optimized, faster but supports fewer loss types)
+        # B) Standard method (flexible, supports all loss types)
+        
         if self.args.use_liger_loss:
+            # Fast path: Use optimized Liger kernel for speed
+            # This fuses operations for better GPU utilization
             model_output = self._compute_loss_liger(model, batch)
             losses = model_output["loss"]
             chosen_rewards = model_output["chosen_rewards"]
             rejected_rewards = model_output["rejected_rewards"]
         else:
+            # Standard path: More flexible, supports all features
+            
+            # Get model's log probabilities for chosen and rejected responses
+            # This runs the model forward on BOTH chosen and rejected at once (efficient!)
             model_output = self.concatenated_forward(model, batch)
+            # model_output contains:
+            #   - chosen_logps: How much model "likes" the chosen response
+            #   - rejected_logps: How much model "likes" the rejected response
 
-            # if ref_chosen_logps and ref_rejected_logps in batch use them, otherwise use the reference model
+            # ================================================================
+            # STEP 2: Get Reference Model Predictions
+            # ================================================================
+            # Check if reference log probs are already in the batch (precomputed)
+            # This is an optimization: compute them once beforehand instead of every batch
             if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
+                # Fast: Use precomputed values
                 ref_chosen_logps = batch["ref_chosen_logps"]
                 ref_rejected_logps = batch["ref_rejected_logps"]
             else:
+                # Slow: Compute reference log probs on the fly
+                # This runs the reference model to get its predictions
                 ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
 
-            # Initialize combined losses
+            # ================================================================
+            # STEP 3: Calculate DPO Loss
+            # ================================================================
+            # Initialize accumulators (for when using multiple loss types)
             losses = 0
             chosen_rewards = 0
             rejected_rewards = 0
 
-            # Compute losses for each loss type
+            # DPO supports multiple loss formulations
+            # Most common: just one loss type ("sigmoid")
+            # Advanced: combine multiple loss types with weights
             for idx, loss_type in enumerate(self.loss_type):
-                # Compute individual loss using standard DPO loss function
+                # Compute the DPO loss for this loss type
+                # This is where the preference comparison happens!
                 _losses, _chosen_rewards, _rejected_rewards = self.dpo_loss(
-                    model_output["chosen_logps"],
-                    model_output["rejected_logps"],
-                    ref_chosen_logps,
-                    ref_rejected_logps,
-                    loss_type,
-                    model_output,
+                    model_output["chosen_logps"],      # Model's score for chosen
+                    model_output["rejected_logps"],    # Model's score for rejected
+                    ref_chosen_logps,                  # Reference score for chosen
+                    ref_rejected_logps,                # Reference score for rejected
+                    loss_type,                         # Which mathematical formulation to use
+                    model_output,                      # Full model output (for advanced features)
                 )
 
-                # Add weighted contributions
+                # If using multiple loss types, weight and combine them
                 weight = self.loss_weights[idx] if self.loss_weights else 1.0
                 losses = losses + _losses * weight
                 chosen_rewards = chosen_rewards + _chosen_rewards * weight
                 rejected_rewards = rejected_rewards + _rejected_rewards * weight
 
+        # ====================================================================
+        # STEP 4: Calculate Accuracy Metric
+        # ====================================================================
+        # Accuracy = how often does the model correctly prefer chosen over rejected?
+        # This is a simple binary metric: 1 if chosen_reward > rejected_reward, else 0
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
+        # ====================================================================
+        # STEP 5: Add Optional Loss Components
+        # ====================================================================
+        
+        # RPO (Regularized Preference Optimization): Add a supervised learning component
+        # This prevents the model from forgetting how to generate fluent text
         if self.args.rpo_alpha is not None:
             losses = losses + self.args.rpo_alpha * model_output["nll_loss"]  # RPO loss from V3 of the paper
 
+        # Weighting: Give more importance to certain examples (advanced feature)
         if self.use_weighting:
             losses = losses * model_output["policy_weights"]
 
+        # Auxiliary loss: For Mixture of Experts models
+        # Helps balance the load across different expert networks
         if self.aux_loss_enabled:
             losses = losses + self.aux_loss_coef * model_output["aux_loss"]
 
+        # ====================================================================
+        # STEP 6: Collect Metrics for Logging
+        # ====================================================================
+        # These metrics help us understand how training is progressing
+        
         prefix = "eval_" if train_eval == "eval" else ""
+        
+        # Reward metrics: How much the model "likes" each response
         metrics[f"{prefix}rewards/chosen"] = self.accelerator.gather_for_metrics(chosen_rewards).mean().item()
         metrics[f"{prefix}rewards/rejected"] = self.accelerator.gather_for_metrics(rejected_rewards).mean().item()
+        
+        # Accuracy: Percentage of times model correctly prefers chosen
         metrics[f"{prefix}rewards/accuracies"] = self.accelerator.gather_for_metrics(reward_accuracies).mean().item()
+        
+        # Margin: How much MORE the model prefers chosen vs rejected
+        # Larger margin = stronger preference (good!)
         metrics[f"{prefix}rewards/margins"] = (
             self.accelerator.gather_for_metrics(chosen_rewards - rejected_rewards).mean().item()
         )
+        
+        # Log probabilities: Raw scores from the model
         metrics[f"{prefix}logps/chosen"] = (
             self.accelerator.gather_for_metrics(model_output["chosen_logps"]).detach().mean().item()
         )
         metrics[f"{prefix}logps/rejected"] = (
             self.accelerator.gather_for_metrics(model_output["rejected_logps"]).detach().mean().item()
         )
+        
+        # Logits: Even rawer scores (before softmax)
         metrics[f"{prefix}logits/chosen"] = (
             self.accelerator.gather_for_metrics(model_output["mean_chosen_logits"]).detach().mean().item()
         )
         metrics[f"{prefix}logits/rejected"] = (
             self.accelerator.gather_for_metrics(model_output["mean_rejected_logits"]).detach().mean().item()
         )
+        
+        # Additional loss components (if enabled)
         if self.args.rpo_alpha is not None or "sft" in self.loss_type:
             metrics[f"{prefix}nll_loss"] = (
                 self.accelerator.gather_for_metrics(model_output["nll_loss"]).detach().mean().item()
@@ -1771,6 +2130,11 @@ class DPOTrainer(BaseTrainer):
                 self.accelerator.gather_for_metrics(model_output["aux_loss"]).detach().mean().item()
             )
 
+        # ====================================================================
+        # RETURN: Loss and Metrics
+        # ====================================================================
+        # loss.mean(): Average loss across the batch (this gets optimized)
+        # metrics: Dictionary of tracking metrics for logging
         return losses.mean(), metrics
 
     def compute_loss(
