@@ -79,10 +79,12 @@ os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 JUDGES = {"pair_rm": PairRMJudge, "openai": OpenAIPairwiseJudge, "hf": HfPairwiseJudge}
 
 if __name__ == "__main__":
+    # Parser the arguments and configurations
     parser = TrlParser((ScriptArguments, OnlineDPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     training_args.gradient_checkpointing_kwargs = {"use_reentrant": True}
 
+    # Initialize the model 
     dtype = model_args.dtype if model_args.dtype in ["auto", None] else getattr(torch, model_args.dtype)
     model_kwargs = dict(
         revision=model_args.model_revision,
@@ -100,6 +102,7 @@ if __name__ == "__main__":
         model_args.model_name_or_path, trust_remote_code=model_args.trust_remote_code, **model_kwargs
     )
 
+    # Initialize the reward model
     if training_args.reward_model_path is not None:
         reward_model = AutoModelForSequenceClassification.from_pretrained(
             training_args.reward_model_path,
@@ -119,12 +122,14 @@ if __name__ == "__main__":
         reward_model = None
         reward_tokenizer = None
 
+    # Initialize the judge
     if training_args.judge is not None:
         judge_cls = JUDGES[training_args.judge]
         judge = judge_cls()
     else:
         judge = None
 
+    # Initialize the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         padding_side="left",
