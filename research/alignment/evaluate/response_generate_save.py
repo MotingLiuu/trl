@@ -4,6 +4,7 @@ import torch
 from datasets import load_dataset
 from transformers import DataCollatorWithPadding
 import logging
+import json
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -71,6 +72,42 @@ model = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float16,
     device_map="cuda",
 ) 
+
+filename = "data/generated_responses_sft.jsonl"
+
+with open(filename, "w") as f:
+    model.eval()
+    logger.info("Model loaded successfully.")
+    with torch.no_grad():
+        for batch in data_loader:
+            outputs = model.generate(
+                input_ids=batch["input_ids"].to(model.device),
+                attention_mask=batch["attention_mask"].to(model.device),
+                max_new_tokens=256,
+                do_sample=True,
+                top_p=0.9,
+                temperature=0.1,
+            )
+            input_text = tokenizer.batch_decode(batch["input_ids"], skip_special_tokens=True)
+            generated_text = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+            generated_responses = [
+                gen_text[len(inp_text):] for inp_text, gen_text in zip(input_text, generated_text)
+            ]
+            for inp, gen in zip(input_text, generated_responses):
+                record = {
+                    "prompt": [{
+                        "role": "user",
+                        "content": inp
+                    }],
+                    "response": [{
+                        "role": "assistant",
+                        "content": gen
+                    }]
+                }
+                json_line = json.dumps(record, ensure_ascii=False)
+                f.write(json_line + "\n")
+            break  # only generate for one batch for demonstration
+    logger.info(f"Generated responses saved to {filename}.")
 
 with torch.no_grad():
     for batch in data_loader:
