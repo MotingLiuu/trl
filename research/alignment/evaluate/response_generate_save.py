@@ -6,7 +6,7 @@ from transformers import DataCollatorWithPadding
 import logging
 import json
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 
 # load dataset
 dataset = load_dataset(
@@ -97,7 +97,7 @@ with open(filename, "w") as f:
                 record = {
                     "prompt": [{
                         "role": "user",
-                        "content": inp
+                        "content": inp[5:]
                     }],
                     "response": [{
                         "role": "assistant",
