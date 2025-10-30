@@ -68,13 +68,13 @@ logger.info(f"Sample batch from DataLoader: {next(iter(data_loader))}")
 # generate responses
 # load model
 model = AutoModelForCausalLM.from_pretrained(
-    "../model/Qwen3-1.7B-sft-config3/checkpoint-1824",
+    "../model/Qwen3-1.7B-simpo-config1/checkpoint-1451",
     trust_remote_code=True,
     torch_dtype=torch.float16,
     device_map="cuda",
 ) 
 
-filename = "data/generated_responses_sft.jsonl"
+filename = "data/generated_responses_simpo.jsonl"
 
 with open(filename, "w") as f:
     model.eval()
