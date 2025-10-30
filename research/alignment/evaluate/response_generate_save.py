@@ -98,7 +98,7 @@ with open(filename, "w") as f:
                 record = {
                     "prompt": [{
                         "role": "user",
-                        "content": inp[5:]
+                        "content": inp[5:-30] # remove the extra tokens added by apply_chat_template
                     }],
                     "response": [{
                         "role": "assistant",
