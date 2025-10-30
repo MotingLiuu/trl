@@ -5,6 +5,7 @@ from datasets import load_dataset
 from transformers import DataCollatorWithPadding
 import logging
 import json
+import tqdm
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
@@ -57,7 +58,7 @@ logger.debug(f"Sample data after tokenization: {dataset['test'][0:2]}")
 # create dataloader
 data_loader = DataLoader(
     dataset["test"],
-    batch_size=8,
+    batch_size=128,
     shuffle=False,
     collate_fn=DataCollatorWithPadding(tokenizer=tokenizer)
 )
@@ -79,7 +80,7 @@ with open(filename, "w") as f:
     model.eval()
     logger.info("Model loaded successfully.")
     with torch.no_grad():
-        for batch in data_loader:
+        for batch in tqdm.tqdm(data_loader, desc="Generating responses"):
             outputs = model.generate(
                 input_ids=batch["input_ids"].to(model.device),
                 attention_mask=batch["attention_mask"].to(model.device),
@@ -106,9 +107,10 @@ with open(filename, "w") as f:
                 }
                 json_line = json.dumps(record, ensure_ascii=False)
                 f.write(json_line + "\n")
-            break  # only generate for one batch for demonstration
-    logger.info(f"Generated responses saved to {filename}.")
 
+    logger.info(f"Generated responses saved to {filename}.")
+   
+'''
 with torch.no_grad():
     for batch in data_loader:
         outputs = model.generate(
@@ -133,3 +135,4 @@ with torch.no_grad():
             print(f"Generated text: {text}")
             print("----------------------------------------------------")
         break  # only generate for one batch for demonstration
+'''
